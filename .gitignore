@@ -20,3 +20,13 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# SQLite databases and WAL/SHM files
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+memory.db
+sidekick_memory.db
