@@ -16,4 +16,5 @@ langchain-community>=0.0.20
 langchain-openai>=0.0.5
 langchain-core>=0.1.0
 langgraph>=0.0.20
+langgraph-checkpoint-sqlite>=3.0.1
 typing-extensions>=4.8.0

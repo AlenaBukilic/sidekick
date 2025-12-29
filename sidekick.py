@@ -5,14 +5,14 @@ from langgraph.graph.message import add_messages
 from dotenv import load_dotenv
 from langgraph.prebuilt import ToolNode
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from typing import List, Any, Optional, Dict
 from pydantic import BaseModel, Field
 from tools import playwright_tools, other_tools
 import uuid
-import asyncio
 from datetime import datetime
+import aiosqlite
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 load_dotenv(override=True)
 
@@ -41,11 +41,28 @@ class Sidekick:
         self.llm_with_tools = None
         self.graph = None
         self.sidekick_id = str(uuid.uuid4())
-        self.memory = MemorySaver()
         self.browser = None
         self.playwright = None
+        self.db_path = "memory.db"
 
     async def setup(self):
+        raw_conn = await aiosqlite.connect(self.db_path)
+        class ConnectionWrapper:
+            def __init__(self, conn):
+                self._conn = conn
+            
+            def is_alive(self):
+                try:
+                    return hasattr(self._conn, '_connection') and self._conn._connection is not None
+                except:
+                    return False
+            
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+        
+        self.db_conn = ConnectionWrapper(raw_conn)
+        self.sqlite_memory = AsyncSqliteSaver(self.db_conn)
+        
         self.tools, self.browser, self.playwright = await playwright_tools()
         self.tools += await other_tools()
         worker_llm = ChatOpenAI(model="gpt-4o-mini")
@@ -171,15 +188,12 @@ class Sidekick:
             return "worker"
 
     async def build_graph(self):
-        # Set up Graph Builder with State
         graph_builder = StateGraph(State)
 
-        # Add nodes
         graph_builder.add_node("worker", self.worker)
         graph_builder.add_node("tools", ToolNode(tools=self.tools))
         graph_builder.add_node("evaluator", self.evaluator)
 
-        # Add edges
         graph_builder.add_conditional_edges(
             "worker", self.worker_router, {"tools": "tools", "evaluator": "evaluator"}
         )
@@ -188,9 +202,7 @@ class Sidekick:
             "evaluator", self.route_based_on_evaluation, {"worker": "worker", "END": END}
         )
         graph_builder.add_edge(START, "worker")
-
-        # Compile the graph
-        self.graph = graph_builder.compile(checkpointer=self.memory)
+        self.graph = graph_builder.compile(checkpointer=self.sqlite_memory)
 
     async def run_superstep(self, message, success_criteria, history):
         config = {"configurable": {"thread_id": self.sidekick_id}}
@@ -208,15 +220,20 @@ class Sidekick:
         feedback = {"role": "assistant", "content": result["messages"][-1].content}
         return history + [user, reply, feedback]
 
-    def cleanup(self):
+    async def cleanup(self):
         if self.browser:
             try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self.browser.close())
+                await self.browser.close()
                 if self.playwright:
-                    loop.create_task(self.playwright.stop())
-            except RuntimeError:
-                # If no loop is running, do a direct run
-                asyncio.run(self.browser.close())
-                if self.playwright:
-                    asyncio.run(self.playwright.stop())
+                    await self.playwright.stop()
+            except Exception as e:
+                print(f"Error closing browser/playwright: {e}")
+        
+        if hasattr(self, 'db_conn') and self.db_conn:
+            try:
+                if hasattr(self.db_conn, '_conn'):
+                    await self.db_conn._conn.close()
+                else:
+                    await self.db_conn.close()
+            except Exception as e:
+                print(f"Error closing database connection: {e}")
