@@ -8,6 +8,8 @@ from langchain_community.agent_toolkits import FileManagementToolkit
 from langchain_community.tools.wikipedia.tool import WikipediaQueryRun
 from langchain_community.utilities import GoogleSerperAPIWrapper
 from langchain_community.utilities.wikipedia import WikipediaAPIWrapper
+from datetime import datetime
+from markdown_pdf import MarkdownPdf, Section
 
 
 
@@ -35,6 +37,37 @@ def get_file_tools():
     return toolkit.get_tools()
 
 
+def generate_pdf_from_markdown(markdown_content: str, filename: str = None) -> str:
+    """Generate a PDF file from markdown content and save it to the sandbox directory.
+    
+    Args:
+        markdown_content: The markdown text to convert to PDF
+        filename: Optional filename for the PDF. If not provided, generates a timestamped filename.
+    
+    Returns:
+        The path to the generated PDF file
+    """
+    if filename is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"export_{timestamp}.pdf"
+    
+    # Ensure filename ends with .pdf
+    if not filename.endswith(".pdf"):
+        filename += ".pdf"
+    
+    # Create full path in sandbox directory
+    sandbox_dir = "sandbox"
+    os.makedirs(sandbox_dir, exist_ok=True)
+    pdf_path = os.path.join(sandbox_dir, filename)
+    
+    # Convert markdown to PDF using markdown-pdf library
+    pdf = MarkdownPdf(toc_level=2)
+    pdf.add_section(Section(markdown_content))
+    pdf.save(pdf_path)
+    
+    return f"PDF generated successfully at: {pdf_path}"
+
+
 async def other_tools():
     push_tool = Tool(name="send_push_notification", func=push, description="Use this tool when you want to send a push notification")
     file_tools = get_file_tools()
@@ -48,5 +81,14 @@ async def other_tools():
     wikipedia = WikipediaAPIWrapper()
     wiki_tool = WikipediaQueryRun(api_wrapper=wikipedia)
     
-    return file_tools + [push_tool, tool_search, wiki_tool]
+    pdf_tool = Tool(
+        name="generate_pdf_from_markdown",
+        func=generate_pdf_from_markdown,
+        description="Use this tool when you need to convert markdown content to a PDF document. "
+                   "Provide the markdown content as a string, and optionally a filename. "
+                   "The PDF will be saved in the sandbox directory. "
+                   "Example: generate_pdf_from_markdown('# Title\\n\\nContent here', 'document.pdf')"
+    )
+    
+    return file_tools + [push_tool, tool_search, wiki_tool, pdf_tool]
 

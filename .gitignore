@@ -30,3 +30,6 @@ Thumbs.db
 *.sqlite-shm
 memory.db
 sidekick_memory.db
+
+# Sandbox directory
+sandbox/

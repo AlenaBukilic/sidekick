@@ -18,3 +18,7 @@ langchain-core>=0.1.0
 langgraph>=0.0.20
 langgraph-checkpoint-sqlite>=3.0.1
 typing-extensions>=4.8.0
+markdownify==1.1.0
+markdown-it-py==3.0.0
+markdown-pdf==1.10
+pymupdf==1.26.7
