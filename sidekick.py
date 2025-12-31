@@ -1,45 +1,70 @@
-from typing import Annotated
-from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
 from dotenv import load_dotenv
 from langgraph.prebuilt import ToolNode
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from typing import List, Any, Optional, Dict
-from pydantic import BaseModel, Field
+from langchain_core.messages import AIMessage, HumanMessage
+from typing import List, Any
 from tools import playwright_tools, other_tools
 import uuid
-from datetime import datetime
 import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
+# Import models and state
+from models import (
+    EvaluatorOutput,
+    ClarifierOutput,
+    PlannerOutput,
+    PlanQualityEvaluation,
+    PerTaskEvaluation,
+    OverallEvaluation
+)
+from state import State
+
+# Import node creators
+from nodes.clarifier import create_clarifier_node, create_wait_for_user_node
+from nodes.planner import create_planner_node
+from nodes.workers import (
+    create_worker_node,
+    create_process_subtask_node,
+    create_parallel_worker_group_node
+)
+from nodes.evaluators import (
+    create_evaluator_node,
+    create_plan_quality_evaluator_node,
+    create_per_task_evaluator_node,
+    create_overall_evaluator_node
+)
+from nodes.collector import create_collector_node
+
+# Import routing functions
+from routing import (
+    create_route_based_on_evaluation,
+    create_route_after_wait_for_user,
+    create_route_after_planner,
+    create_route_after_plan_quality,
+    create_move_to_next_group,
+    create_route_after_per_task_evaluation,
+    create_route_after_overall_evaluation,
+    create_route_from_start,
+    create_worker_router
+)
+
 load_dotenv(override=True)
-
-
-class State(TypedDict):
-    messages: Annotated[List[Any], add_messages]
-    success_criteria: str
-    feedback_on_work: Optional[str]
-    success_criteria_met: bool
-    user_input_needed: bool
-
-
-class EvaluatorOutput(BaseModel):
-    feedback: str = Field(description="Feedback on the assistant's response")
-    success_criteria_met: bool = Field(description="Whether the success criteria have been met")
-    user_input_needed: bool = Field(
-        description="True if more input is needed from the user, or clarifications, or the assistant is stuck"
-    )
 
 
 class Sidekick:
     def __init__(self):
         self.worker_llm_with_tools = None
         self.evaluator_llm_with_output = None
+        self.clarifier_llm_with_output = None
+        self.planner_llm_with_output = None
+        self.plan_quality_evaluator_llm_with_output = None
+        self.per_task_evaluator_llm_with_output = None
+        self.overall_evaluator_llm_with_output = None
         self.tools = None
         self.llm_with_tools = None
         self.graph = None
+        self.clarifier = None  # Store clarifier node function for direct access
         self.sidekick_id = str(uuid.uuid4())
         self.browser = None
         self.playwright = None
@@ -69,156 +94,172 @@ class Sidekick:
         self.worker_llm_with_tools = worker_llm.bind_tools(self.tools)
         evaluator_llm = ChatOpenAI(model="gpt-4o-mini")
         self.evaluator_llm_with_output = evaluator_llm.with_structured_output(EvaluatorOutput)
+        clarifier_llm = ChatOpenAI(model="gpt-4o-mini")
+        self.clarifier_llm_with_output = clarifier_llm.with_structured_output(ClarifierOutput)
+        planner_llm = ChatOpenAI(model="gpt-4o-mini")
+        self.planner_llm_with_output = planner_llm.with_structured_output(PlannerOutput)
+        plan_quality_llm = ChatOpenAI(model="gpt-4o-mini")
+        self.plan_quality_evaluator_llm_with_output = plan_quality_llm.with_structured_output(PlanQualityEvaluation)
+        per_task_llm = ChatOpenAI(model="gpt-4o-mini")
+        self.per_task_evaluator_llm_with_output = per_task_llm.with_structured_output(PerTaskEvaluation)
+        overall_llm = ChatOpenAI(model="gpt-4o-mini")
+        self.overall_evaluator_llm_with_output = overall_llm.with_structured_output(OverallEvaluation)
+        
         await self.build_graph()
-
-    def worker(self, state: State) -> Dict[str, Any]:
-        system_message = f"""You are a helpful assistant that can use tools to complete tasks.
-    You keep working on a task until either you have a question or clarification for the user, or the success criteria is met.
-    You have many tools to help you, including tools to browse the internet, navigating and retrieving web pages.
-    You have a tool to run python code, but note that you would need to include a print() statement if you wanted to receive output.
-    The current date and time is {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-
-    This is the success criteria:
-    {state["success_criteria"]}
-    You should reply either with a question for the user about this assignment, or with your final response.
-    If you have a question for the user, you need to reply by clearly stating your question. An example might be:
-
-    Question: please clarify whether you want a summary or a detailed answer
-
-    If you've finished, reply with the final answer, and don't ask a question; simply reply with the answer.
-    """
-
-        if state.get("feedback_on_work"):
-            system_message += f"""
-    Previously you thought you completed the assignment, but your reply was rejected because the success criteria was not met.
-    Here is the feedback on why this was rejected:
-    {state["feedback_on_work"]}
-    With this feedback, please continue the assignment, ensuring that you meet the success criteria or have a question for the user."""
-
-        # Add in the system message
-
-        found_system_message = False
-        messages = state["messages"]
-        for message in messages:
-            if isinstance(message, SystemMessage):
-                message.content = system_message
-                found_system_message = True
-
-        if not found_system_message:
-            messages = [SystemMessage(content=system_message)] + messages
-
-        # Invoke the LLM with tools
-        response = self.worker_llm_with_tools.invoke(messages)
-
-        # Return updated state
-        return {
-            "messages": [response],
-        }
-
-    def worker_router(self, state: State) -> str:
-        last_message = state["messages"][-1]
-
-        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-            return "tools"
-        else:
-            return "evaluator"
-
-    def format_conversation(self, messages: List[Any]) -> str:
-        conversation = "Conversation history:\n\n"
-        for message in messages:
-            if isinstance(message, HumanMessage):
-                conversation += f"User: {message.content}\n"
-            elif isinstance(message, AIMessage):
-                text = message.content or "[Tools use]"
-                conversation += f"Assistant: {text}\n"
-        return conversation
-
-    def evaluator(self, state: State) -> State:
-        last_response = state["messages"][-1].content
-
-        system_message = """You are an evaluator that determines if a task has been completed successfully by an Assistant.
-    Assess the Assistant's last response based on the given criteria. Respond with your feedback, and with your decision on whether the success criteria has been met,
-    and whether more input is needed from the user."""
-
-        user_message = f"""You are evaluating a conversation between the User and Assistant. You decide what action to take based on the last response from the Assistant.
-
-    The entire conversation with the assistant, with the user's original request and all replies, is:
-    {self.format_conversation(state["messages"])}
-
-    The success criteria for this assignment is:
-    {state["success_criteria"]}
-
-    And the final response from the Assistant that you are evaluating is:
-    {last_response}
-
-    Respond with your feedback, and decide if the success criteria is met by this response.
-    Also, decide if more user input is required, either because the assistant has a question, needs clarification, or seems to be stuck and unable to answer without help.
-
-    The Assistant has access to a tool to write files. If the Assistant says they have written a file, then you can assume they have done so.
-    Overall you should give the Assistant the benefit of the doubt if they say they've done something. But you should reject if you feel that more work should go into this.
-
-    """
-        if state["feedback_on_work"]:
-            user_message += f"Also, note that in a prior attempt from the Assistant, you provided this feedback: {state['feedback_on_work']}\n"
-            user_message += "If you're seeing the Assistant repeating the same mistakes, then consider responding that user input is required."
-
-        evaluator_messages = [
-            SystemMessage(content=system_message),
-            HumanMessage(content=user_message),
-        ]
-
-        eval_result = self.evaluator_llm_with_output.invoke(evaluator_messages)
-        new_state = {
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": f"Evaluator Feedback on this answer: {eval_result.feedback}",
-                }
-            ],
-            "feedback_on_work": eval_result.feedback,
-            "success_criteria_met": eval_result.success_criteria_met,
-            "user_input_needed": eval_result.user_input_needed,
-        }
-        return new_state
-
-    def route_based_on_evaluation(self, state: State) -> str:
-        if state["success_criteria_met"] or state["user_input_needed"]:
-            return "END"
-        else:
-            return "worker"
 
     async def build_graph(self):
         graph_builder = StateGraph(State)
 
-        graph_builder.add_node("worker", self.worker)
+        # Create routing functions
+        move_to_next_group = create_move_to_next_group()
+        route_from_start = create_route_from_start()
+        route_after_wait_for_user = create_route_after_wait_for_user()
+        route_after_planner = create_route_after_planner()
+        route_after_plan_quality = create_route_after_plan_quality()
+        route_after_per_task_evaluation = create_route_after_per_task_evaluation()
+        route_after_overall_evaluation = create_route_after_overall_evaluation()
+        route_based_on_evaluation = create_route_based_on_evaluation()
+        worker_router = create_worker_router()
+
+        # Create node functions
+        worker = create_worker_node(self.worker_llm_with_tools)
+        evaluator = create_evaluator_node(self.evaluator_llm_with_output)
+        clarifier = create_clarifier_node(self.clarifier_llm_with_output)
+        self.clarifier = clarifier  # Store for direct access from UI
+        wait_for_user = create_wait_for_user_node()
+        planner = create_planner_node(self.planner_llm_with_output, move_to_next_group)
+        plan_quality_evaluator = create_plan_quality_evaluator_node(self.plan_quality_evaluator_llm_with_output)
+        process_subtask = create_process_subtask_node(self.worker_llm_with_tools, self.tools)
+        parallel_worker_group = create_parallel_worker_group_node(process_subtask)
+        collector = create_collector_node()
+        per_task_evaluator = create_per_task_evaluator_node(self.per_task_evaluator_llm_with_output)
+        overall_evaluator = create_overall_evaluator_node(self.overall_evaluator_llm_with_output)
+
+        # Add nodes to graph
+        graph_builder.add_node("worker", worker)
         graph_builder.add_node("tools", ToolNode(tools=self.tools))
-        graph_builder.add_node("evaluator", self.evaluator)
+        graph_builder.add_node("evaluator", evaluator)
+        graph_builder.add_node("clarifier", clarifier)
+        graph_builder.add_node("wait_for_user", wait_for_user)
+        graph_builder.add_node("planner", planner)
+        graph_builder.add_node("plan_quality_evaluator", plan_quality_evaluator)
+        graph_builder.add_node("parallel_worker_group", parallel_worker_group)
+        graph_builder.add_node("collector", collector)
+        graph_builder.add_node("per_task_evaluator", per_task_evaluator)
+        graph_builder.add_node("overall_evaluator", overall_evaluator)
+
+        # Add edges
+        graph_builder.add_conditional_edges(
+            START,
+            route_from_start,
+            {"clarifier": "clarifier", "planner": "planner"}
+        )
+        
+        graph_builder.add_edge("clarifier", "wait_for_user")
+        
+        graph_builder.add_conditional_edges(
+            "wait_for_user",
+            route_after_wait_for_user,
+            {"planner": "planner", "END": END}
+        )
+        
+        graph_builder.add_conditional_edges(
+            "planner",
+            route_after_planner,
+            {"plan_quality_evaluator": "plan_quality_evaluator", "parallel_worker_group": "parallel_worker_group"}
+        )
+        
+        graph_builder.add_conditional_edges(
+            "plan_quality_evaluator",
+            route_after_plan_quality,
+            {"planner": "planner", "parallel_worker_group": "parallel_worker_group"}
+        )
+        
+        graph_builder.add_edge("parallel_worker_group", "collector")
+        
+        graph_builder.add_edge("collector", "per_task_evaluator")
+        
+        graph_builder.add_conditional_edges(
+            "per_task_evaluator",
+            route_after_per_task_evaluation,
+            {"planner": "planner", "overall_evaluator": "overall_evaluator"}
+        )
+        
+        graph_builder.add_conditional_edges(
+            "overall_evaluator",
+            route_after_overall_evaluation,
+            {"planner": "planner", "END": END}
+        )
 
         graph_builder.add_conditional_edges(
-            "worker", self.worker_router, {"tools": "tools", "evaluator": "evaluator"}
+            "worker", worker_router, {"tools": "tools", "evaluator": "evaluator"}
         )
         graph_builder.add_edge("tools", "worker")
         graph_builder.add_conditional_edges(
-            "evaluator", self.route_based_on_evaluation, {"worker": "worker", "END": END}
+            "evaluator", route_based_on_evaluation, {"worker": "worker", "END": END}
         )
-        graph_builder.add_edge(START, "worker")
+
         self.graph = graph_builder.compile(checkpointer=self.sqlite_memory)
 
-    async def run_superstep(self, message, success_criteria, history):
-        config = {"configurable": {"thread_id": self.sidekick_id}}
+    async def run_superstep(self, message, success_criteria, history, clarification_answers=None):
+        config = {
+            "configurable": {"thread_id": self.sidekick_id},
+            "recursion_limit": 100
+        }
+        
+        if isinstance(message, str):
+            messages = [HumanMessage(content=message)]
+        else:
+            messages = message if isinstance(message, list) else [message]
 
+        valid_answers = []
+        if clarification_answers:
+            valid_answers = [a for a in clarification_answers if a and str(a).strip()]
+        
+        clarification_complete = len(valid_answers) >= 3
+        
         state = {
-            "messages": message,
+            "messages": messages,
             "success_criteria": success_criteria or "The answer should be clear and accurate",
             "feedback_on_work": None,
             "success_criteria_met": False,
             "user_input_needed": False,
+            "clarification_questions": None,
+            "clarification_answers": valid_answers,
+            "clarification_complete": clarification_complete,
+            "task_plan": None,
+            "parallel_groups": None,
+            "current_parallel_group": 0,
+            "worker_results": {},
+            "all_tasks_complete": False,
+            "planning_complete": False,
+            "plan_quality_score": None,
+            "plan_needs_refinement": False,
+            "plan_quality_check_enabled": True,
+            "task_evaluation_results": {},
+            "overall_evaluation_score": None,
         }
+        
         result = await self.graph.ainvoke(state, config=config)
-        user = {"role": "user", "content": message}
-        reply = {"role": "assistant", "content": result["messages"][-2].content}
-        feedback = {"role": "assistant", "content": result["messages"][-1].content}
-        return history + [user, reply, feedback]
+        
+        final_messages = result.get("messages", [])
+        if final_messages:
+            user = {"role": "user", "content": message if isinstance(message, str) else messages[0].content}
+            last_assistant_msg = None
+            for msg in reversed(final_messages):
+                if isinstance(msg, dict) and msg.get("role") == "assistant":
+                    last_assistant_msg = msg
+                    break
+                elif isinstance(msg, AIMessage):
+                    last_assistant_msg = {"role": "assistant", "content": msg.content}
+                    break
+            
+            if last_assistant_msg:
+                return history + [user, last_assistant_msg]
+            else:
+                return history + [user, {"role": "assistant", "content": "Processing..."}]
+        
+        return history
 
     async def cleanup(self):
         if self.browser:
